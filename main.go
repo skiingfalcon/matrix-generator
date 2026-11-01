@@ -1,136 +1,112 @@
+// Command ccmatrix fills the terminal with falling text, like the film The
+// Matrix. See README.md for the options.
 package main
 
 import (
-	"bytes"
+	"errors"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 )
 
 func main() {
-	screensaver := flag.Bool("s", false, "screensaver mode: exit on any key or mouse")
-	updateStr := flag.String("u", "4", "update delay 0-10 (0=fastest, default 4)")
-	colourName := flag.String("C", "green", "trail colour")
-	rainbow := flag.Bool("r", false, "rainbow trail colours")
-	katakana := flag.Bool("c", false, "use half-width katakana characters")
-
-	flag.Parse()
-
-	updateDelay, err := strconv.Atoi(*updateStr)
-	if err != nil || updateDelay < 0 || updateDelay > 10 {
-		fmt.Fprintf(os.Stderr, "ccmatrix: -u must be an integer from 0 to 10, got %q\n", *updateStr)
-		os.Exit(1)
+	cfg, err := parseConfig(os.Args[1:], os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return
 	}
-
-	colourCode, err := ResolveColour(*colourName)
 	if err != nil {
+		os.Exit(2) // parseConfig has already reported the problem
+	}
+	if err := run(cfg, os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "ccmatrix: %v\n", err)
 		os.Exit(1)
 	}
+}
 
-	cfg := Config{
-		ColourCode: colourCode,
-		Rainbow:    *rainbow,
-		Katakana:   *katakana,
-	}
-
-	term, err := NewTerminal(*screensaver)
+// run animates the rain on the terminal until the user quits or a signal
+// arrives. The terminal is restored before run returns, whatever happens.
+func run(cfg config, stdin, stdout *os.File) (err error) {
+	t, err := openTerminal(stdin, stdout, cfg.screensaver)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ccmatrix: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	defer term.Restore()
+	defer func() {
+		err = errors.Join(err, t.restore())
+	}()
 
-	// Restore on SIGINT / SIGTERM.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	winchCh := make(chan os.Signal, 1)
-	signal.Notify(winchCh, syscall.SIGWINCH)
-
-	width, height, err := term.Size()
+	width, height, err := t.size()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ccmatrix: get size: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("get terminal size: %w", err)
 	}
+	r := newRain(width, height, cfg.style, rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0)))
 
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	rain := NewRain(width, height, cfg, rng)
+	// In raw mode Ctrl-C is an ordinary key, so these come from elsewhere,
+	// such as kill or the terminal closing.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(quit)
 
-	keys := make(chan byte, 64)
-	go readKeys(keys)
+	resized := make(chan os.Signal, 1)
+	signal.Notify(resized, syscall.SIGWINCH)
+	defer signal.Stop(resized)
 
-	speed := updateDelay
-	ticker := time.NewTicker(time.Duration(FrameDelayMs(speed)) * time.Millisecond)
+	done := make(chan struct{})
+	defer close(done)
+	input := make(chan []byte)
+	go readInput(stdin, input, done)
+
+	ticker := time.NewTicker(frameDelay(cfg.delay))
 	defer ticker.Stop()
 
-	var buf bytes.Buffer
+	var frame []byte
+	draw := func() error {
+		frame = r.render(frame[:0])
+		if _, err := stdout.Write(frame); err != nil {
+			return fmt.Errorf("draw: %w", err)
+		}
+		return nil
+	}
 
 	for {
 		select {
-		case <-sigCh:
-			return
+		case <-quit:
+			return nil
 
-		case <-winchCh:
-			w, h, err := term.Size()
+		case <-resized:
+			width, height, err := t.size()
 			if err != nil {
-				continue
+				return fmt.Errorf("get terminal size: %w", err)
 			}
-			Clear()
-			rain.Resize(w, h)
+			r.resize(width, height)
+			if err := draw(); err != nil {
+				return err
+			}
 
-		case b := <-keys:
-			if *screensaver {
-				return
+		case b, ok := <-input:
+			if !ok {
+				return errors.New("standard input closed")
 			}
-			switch {
-			case b == 'q' || b == 'Q':
-				return
-			case b >= '0' && b <= '9':
-				speed = int(b - '0')
-				ticker.Reset(time.Duration(FrameDelayMs(speed)) * time.Millisecond)
+			if cfg.screensaver {
+				return nil
 			}
-			// Drain any remaining buffered escape / mouse bytes in screensaver
-			// is already handled above; for normal mode ignore extras.
-			drainKeys(keys)
+			for _, k := range plainKeys(b) {
+				switch {
+				case k == 'q' || k == 'Q' || k == keyCtrlC:
+					return nil
+				case k >= '0' && k <= '9':
+					ticker.Reset(frameDelay(int(k - '0')))
+				}
+			}
 
 		case <-ticker.C:
-			rain.Tick()
-			rain.Render(&buf)
-			os.Stdout.Write(buf.Bytes())
-		}
-	}
-}
-
-// readKeys reads raw bytes from stdin and forwards them on ch.
-func readKeys(ch chan<- byte) {
-	buf := make([]byte, 64)
-	for {
-		n, err := os.Stdin.Read(buf)
-		if err != nil {
-			return
-		}
-		for i := 0; i < n; i++ {
-			select {
-			case ch <- buf[i]:
-			default:
+			r.tick()
+			if err := draw(); err != nil {
+				return err
 			}
-		}
-	}
-}
-
-// drainKeys empties the key channel without blocking.
-func drainKeys(ch <-chan byte) {
-	for {
-		select {
-		case <-ch:
-		default:
-			return
 		}
 	}
 }

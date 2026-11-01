@@ -1,209 +1,179 @@
 package main
 
 import (
-	"bytes"
-	"fmt"
-	"math/rand"
-	"strings"
+	"math/rand/v2"
+	"unicode/utf8"
 )
-
-// Supported trail colours and their ANSI foreground codes.
-var colourCodes = map[string]int{
-	"black":   30,
-	"red":     31,
-	"green":   32,
-	"yellow":  33,
-	"blue":    34,
-	"magenta": 35,
-	"cyan":    36,
-	"white":   37,
-}
-
-// SupportedColours returns the sorted list of colour names for error messages.
-func SupportedColours() []string {
-	return []string{"black", "blue", "cyan", "green", "magenta", "red", "white", "yellow"}
-}
-
-// ResolveColour looks up a colour name. Returns an error listing supported colours
-// if the name is unknown.
-func ResolveColour(name string) (int, error) {
-	code, ok := colourCodes[strings.ToLower(name)]
-	if !ok {
-		return 0, fmt.Errorf("unknown colour %q; supported: %s",
-			name, strings.Join(SupportedColours(), ", "))
-	}
-	return code, nil
-}
-
-// Rainbow palette used with -r (excludes black for visibility).
-var rainbowCodes = []int{31, 33, 32, 36, 34, 35, 37}
 
 const (
 	asciiChars    = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-	katakanaStart = 0xFF66
-	katakanaEnd   = 0xFF9D
+	katakanaFirst = 0xFF66 // half-width katakana WO
+	katakanaLast  = 0xFF9D // half-width katakana N
 )
 
-// Config holds rendering options for the rain effect.
-type Config struct {
-	ColourCode int  // ANSI colour for trails
-	Rainbow    bool // use rainbow colours instead of ColourCode
-	Katakana   bool // use half-width katakana instead of ASCII
+// column is one vertical stream of falling characters. chars[0] is the head
+// and chars[t] is drawn t rows above it, so the whole trail moves with the
+// head.
+type column struct {
+	head      int // row of the head; negative while still above the screen
+	length    int // trail length in rows, including the head
+	speed     int // frames between advances
+	countdown int // frames left until the next advance
+	delay     int // frames to wait before starting
+	chars     []rune
+	dirty     bool // moved since it was last drawn
 }
 
-// Column is one vertical stream of falling characters.
-type Column struct {
-	head    int   // current head row (0-based); can be above or below the screen
-	length  int   // trail length in rows
-	speed   int   // frames between advances
-	counter int   // countdown until next advance
-	delay   int   // frames to wait before first appearance
-	chars   []rune
-}
-
-// Rain owns every column and draws frames into a buffer.
-type Rain struct {
+// rain is a screen full of columns. It is not safe for concurrent use.
+type rain struct {
 	width, height int
-	columns       []Column
-	cfg           Config
+	columns       []column
+	style         style
 	rng           *rand.Rand
+	sgr           sgrTable
+	clear         bool // the next render must clear the screen and redraw everything
 }
 
-// NewRain creates a rain field sized to the given terminal dimensions.
-func NewRain(width, height int, cfg Config, rng *rand.Rand) *Rain {
-	r := &Rain{cfg: cfg, rng: rng}
-	r.Resize(width, height)
+func newRain(width, height int, st style, rng *rand.Rand) *rain {
+	r := &rain{style: st, rng: rng, sgr: newSGRTable()}
+	r.resize(width, height)
 	return r
 }
 
-// Resize rebuilds columns to match a new terminal size.
-func (r *Rain) Resize(width, height int) {
-	if width < 1 {
-		width = 1
+// resize fits the rain to a new screen size. Columns that are still on screen
+// keep falling; new columns start after a random delay. The next render
+// clears the screen and redraws it in full.
+func (r *rain) resize(width, height int) {
+	r.width = max(width, 1)
+	r.height = max(height, 1)
+	if r.width < len(r.columns) {
+		r.columns = r.columns[:r.width]
 	}
-	if height < 1 {
-		height = 1
+	for len(r.columns) < r.width {
+		r.columns = append(r.columns, r.newColumn(true))
 	}
-	r.width = width
-	r.height = height
-	r.columns = make([]Column, width)
-	for i := range r.columns {
-		r.resetColumn(i, true)
-	}
+	r.clear = true
 }
 
-// resetColumn re-initialises column i. If staggered is true the column waits a
-// random delay before starting, which avoids a uniform first frame.
-func (r *Rain) resetColumn(i int, staggered bool) {
-	span := r.height / 2
-	if span < 1 {
-		span = 1
-	}
-	length := 3 + r.rng.Intn(span)
-	if length > r.height {
-		length = r.height
-	}
-	c := Column{
-		head:   -1 - r.rng.Intn(r.height), // start above the screen
+// newColumn returns a column that starts above the screen. If staggered is
+// true it also waits a random number of frames, so that a fresh screen does
+// not start with every column in step.
+func (r *rain) newColumn(staggered bool) column {
+	length := min(3+r.rng.IntN(max(r.height/2, 1)), r.height)
+	c := column{
+		head:   -1 - r.rng.IntN(r.height),
 		length: length,
-		speed:  1 + r.rng.Intn(4),
+		speed:  1 + r.rng.IntN(4),
 		chars:  make([]rune, length),
+		dirty:  true,
 	}
-	for j := range c.chars {
-		c.chars[j] = r.randomChar()
-	}
+	c.countdown = c.speed
 	if staggered {
-		c.delay = r.rng.Intn(r.height * 2)
+		c.delay = r.rng.IntN(r.height * 2)
 	}
-	c.counter = c.speed
-	r.columns[i] = c
+	for i := range c.chars {
+		c.chars[i] = r.randomChar()
+	}
+	return c
 }
 
-func (r *Rain) randomChar() rune {
-	if r.cfg.Katakana {
-		return rune(katakanaStart + r.rng.Intn(katakanaEnd-katakanaStart+1))
+func (r *rain) randomChar() rune {
+	if r.style.katakana {
+		return rune(katakanaFirst + r.rng.IntN(katakanaLast-katakanaFirst+1))
 	}
-	return rune(asciiChars[r.rng.Intn(len(asciiChars))])
+	return rune(asciiChars[r.rng.IntN(len(asciiChars))])
 }
 
-// Tick advances every column by one frame.
-func (r *Rain) Tick() {
+// tick advances the animation by one frame. Call render after every tick:
+// render blanks only the one cell each column has just left.
+func (r *rain) tick() {
 	for i := range r.columns {
 		c := &r.columns[i]
 		if c.delay > 0 {
 			c.delay--
 			continue
 		}
-		c.counter--
-		if c.counter > 0 {
+		c.countdown--
+		if c.countdown > 0 {
 			continue
 		}
-		c.counter = c.speed
+		c.countdown = c.speed
 		c.head++
+		c.dirty = true
 
-		// Flicker: occasionally change a random trail character.
-		if len(c.chars) > 0 && r.rng.Intn(3) == 0 {
-			idx := r.rng.Intn(len(c.chars))
-			c.chars[idx] = r.randomChar()
+		// Flicker: now and then change one character in the trail.
+		if r.rng.IntN(3) == 0 {
+			c.chars[r.rng.IntN(len(c.chars))] = r.randomChar()
 		}
+		// Shift the trail down one place and give the head a new character.
+		copy(c.chars[1:], c.chars)
+		c.chars[0] = r.randomChar()
 
-		// Shift trail: new head char at front, drop oldest.
-		newChar := r.randomChar()
-		copy(c.chars[1:], c.chars[:len(c.chars)-1])
-		c.chars[0] = newChar
-
-		// Fully off the bottom: recycle.
 		if c.head-c.length >= r.height {
-			r.resetColumn(i, false)
+			*c = r.newColumn(false)
 		}
 	}
 }
 
-// Render draws the current frame into buf.
-func (r *Rain) Render(buf *bytes.Buffer) {
-	buf.Reset()
-	for col := 0; col < r.width; col++ {
-		c := &r.columns[col]
-		if c.delay > 0 {
+// render appends the escape sequences that bring the screen up to date to dst
+// and returns the result. Only columns that moved since the last render are
+// drawn, unless the screen has to be cleared after a resize.
+func (r *rain) render(dst []byte) []byte {
+	full := r.clear
+	if full {
+		dst = append(dst, clearScreen...)
+		r.clear = false
+	}
+	current := "" // the SGR sequence in effect, to avoid sending it twice
+	for x := range r.columns {
+		c := &r.columns[x]
+		if c.delay > 0 || (!c.dirty && !full) {
 			continue
 		}
-		for t := 0; t < c.length; t++ {
-			row := c.head - t
-			if row < 0 || row >= r.height {
+		c.dirty = false
+		for t := range c.length {
+			y := c.head - t
+			if y < 0 || y >= r.height {
 				continue
 			}
-			ch := c.chars[t]
-			buf.WriteString(MoveTo(col, row))
-			if t == 0 {
-				// Bright white head.
-				buf.WriteString("\x1b[1;37m")
-			} else {
-				code := r.cfg.ColourCode
-				if r.cfg.Rainbow {
-					code = rainbowCodes[t%len(rainbowCodes)]
-				}
-				// Fade: bright near the head, dim further back.
-				if t < c.length/3 {
-					buf.WriteString(fmt.Sprintf("\x1b[1;%dm", code))
-				} else if t < 2*c.length/3 {
-					buf.WriteString(fmt.Sprintf("\x1b[%dm", code))
-				} else {
-					buf.WriteString(fmt.Sprintf("\x1b[2;%dm", code))
-				}
+			dst = moveTo(dst, x, y)
+			if s := r.cellSGR(t, c.length); s != current {
+				dst = append(dst, s...)
+				current = s
 			}
-			buf.WriteRune(ch)
+			dst = utf8.AppendRune(dst, c.chars[t])
 		}
-		// Erase the cell just behind the trail.
-		eraseRow := c.head - c.length
-		if eraseRow >= 0 && eraseRow < r.height {
-			buf.WriteString(MoveTo(col, eraseRow))
-			buf.WriteString("\x1b[0m ")
+		// Blank the cell the end of the trail has just left. A space only
+		// shows the background, which is never changed, so the SGR state
+		// does not matter here.
+		if y := c.head - c.length; y >= 0 && y < r.height {
+			dst = moveTo(dst, x, y)
+			dst = append(dst, ' ')
 		}
 	}
-	buf.WriteString("\x1b[0m")
+	if current != "" {
+		dst = append(dst, sgrReset...)
+	}
+	return dst
 }
 
-// FrameDelayMs returns the duration between frames for a given -u value (0–10).
-func FrameDelayMs(u int) int {
-	return 10 + u*10
+// cellSGR returns the SGR sequence for the cell t rows above the head of a
+// trail of the given length: a bright white head, then the trail colour
+// fading from bold to normal to dim.
+func (r *rain) cellSGR(t, length int) string {
+	if t == 0 {
+		return sgrHead
+	}
+	code := r.style.colour
+	if r.style.rainbow {
+		code = rainbowCodes[t%len(rainbowCodes)]
+	}
+	switch {
+	case t < length/3:
+		return r.sgr[code-30][fadeBright]
+	case t < 2*length/3:
+		return r.sgr[code-30][fadeNormal]
+	default:
+		return r.sgr[code-30][fadeDim]
+	}
 }
